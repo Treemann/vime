@@ -599,7 +599,7 @@ def _engine_visible_devices(base: int, local_num_gpus: int, num_gpus_per_node: i
         is_hip = False
     if not is_hip:
         return ",".join(str(g) for g in own)
-    rest = [g for g in range(max(num_gpus_per_node, base + local_num_gpus)) if g not in own]
+    rest = [g for g in range(num_gpus_per_node) if g not in own]
     return ",".join(str(g) for g in own + rest)
 
 
