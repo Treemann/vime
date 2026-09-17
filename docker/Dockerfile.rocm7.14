@@ -17,7 +17,8 @@ ARG VLLM_COMMIT=98dff2a81d747d1dba01a47f939f48c3526d4206
 ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM
 ARG MEGATRON_COMMIT=1dcf0dafa884ad52ffb243625717a3471643e087
 ARG TMS_REPO=https://github.com/fzyzcjy/torch_memory_saver.git
-ARG TMS_COMMIT=d64a639
+# Align HIP VMM allocation sizes to allocation granularity (required for --offload-train).
+ARG TMS_COMMIT=016938275e46e72e7b8d60e8d15046171b3e3c72
 ARG PATCH_VERSION=latest
 
 ARG BUILD_ROCM_ARCH=gfx942
@@ -160,7 +161,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -c "${ROCM_CONSTRAINTS}" -r requirements.txt
 
 # Megatron requires NumPy 1.x: this base ships 2.3.5 and Megatron-LM asserts numpy < 2 at import,
-# killing the trainer actor after the vLLM engine is already up. 
+# killing the trainer actor after the vLLM engine is already up.
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eux; \
     python3 -m pip uninstall -y tilelang || true; \
@@ -177,18 +178,43 @@ RUN set -eux; \
     python3 -c "import megatron.training, megatron.core, vime; print('megatron.training', megatron.training.__file__)"
 
 # ====================================== Runtime environment ====================================
+# Work around ROCm HIP IPC imported-memory not being released after repeated weight sync.
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 ENV CUDA_DEVICE_MAX_CONNECTIONS=1
 ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 ENV RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 ENV VLLM_USE_MEGA_AOT_ARTIFACT=0
 
+# Disable LargeBAR in the ROCm runtime: with the pinned TMS commit, VMM-backed tensors can
+# SIGSEGV on .item() when large BAR is enabled (default on MI300-class hosts). Required for
+# --offload-train.
+ENV ROC_ENABLE_LARGE_BAR=0
+
+# The step below exists for --offload-train, which LD_PRELOADs torch_memory_saver's hook into the train workers.
+# Its root cause is a property of this image rather than of vime, so it is configured here.
+#
+# rocm_sdk ships byte-identical copies of libamd_comgr.so.3 under both _rocm_sdk_core and
+# _rocm_sdk_devel, and comgr statically links LLVM. The loader dedups by inode, but these are
+# separate files, so both can load and count as two LLVM instances: the preloaded hook resolves one while rocm_sdk dlopens the
+# other, and the second LLVM aborts the worker with "Option 'spirv-expand-step' registered
+# more than once". Point every copy at the one rocm_sdk itself resolves, which fixes the cause
+# instead of steering search order and so leaves other libraries' resolution alone.
+#
+# The closing import is the guard, not a smoke test: it is the exact abort this prevents, it
+# needs no GPU, and it fails the build should the paths ever stop matching reality.
+RUN set -eux; \
+    CANON="$(python3 -c 'import rocm_sdk; print(rocm_sdk.find_libraries("amdhip64")[0].parent / "libamd_comgr.so.3")')"; \
+    find "${CANON%/_rocm_sdk_*}"/_rocm_sdk_*/lib -name 'libamd_comgr.so*' -type f ! -samefile "${CANON}" \
+        -exec ln -sfn "${CANON}" {} \; -print; \
+    HOOK="$(python3 -c 'import glob, os, torch_memory_saver; print(glob.glob(os.path.join(os.path.dirname(os.path.dirname(torch_memory_saver.__file__)), "torch_memory_saver_hook_mode_preload*.so"))[0])')"; \
+    LD_PRELOAD="${HOOK}" TMS_INIT_ENABLE=1 python3 -c 'import torch; print("hook + torch ok:", torch.__version__)'
+
 # ====================================== Verification ===========================================
 # Fail the build, not the first training run. This asserts that the base image's ROCm torch was not
 # replaced by a PyPI CUDA wheel, that VLLM_TAG is what actually got installed, and that the vLLM API
 # window vime needs is present at BOTH ends — the cli_args module this vime revision imports, and
 # the NCCLTrainerInitInfo class that v0.27.1 predates. GPU assertions are not possible here because
-# `docker build` has no devices; the last line prints the device count for a run-time check.
+# `docker build` has no devices; the last line prints the device count for a runtime check.
 RUN python3 - "${VLLM_TAG#v}" <<'PY'
 import importlib
 import pathlib
@@ -241,7 +267,7 @@ for module_name, symbol in [
         check(f"{module_name}.{symbol}", False, f"{type(exc).__name__}: {exc}")
 
 print(f"[info] visible devices at build time: {torch.cuda.device_count()} "
-      "(expected 0; check at run time)")
+      "(expected 0; check at runtime)")
 sys.exit(f"{len(failed)} check(s) failed: {failed}" if failed else 0)
 PY
 
